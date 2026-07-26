@@ -1,0 +1,7 @@
+duckdb
+numpy
+Pillow
+pyarrow
+python-dotenv
+rasterio
+tqdm
