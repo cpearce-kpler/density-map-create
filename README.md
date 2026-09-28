@@ -497,61 +497,40 @@ Set `KEEP_WORK=true` only when intermediate DuckDB and Parquet files are needed 
 
 # Code Summary
 
-The AIS density-map script converts downloaded vessel-position data into visual and analytical maps of maritime activity. It reads the raw AIS Parquet files directly, filters the records to selected vessel groups using the vessel metadata file, and applies a configurable minimum-speed threshold so stopped or near-stopped vessels can be excluded.
+The new AIS density-map script converts raw AIS vessel-position data into reusable analytical and visual density-map products. It reads the source Parquet files with DuckDB, optionally filters them to selected vessel groups using vessel metadata, applies configurable speed and track-quality rules, and stages the retained AIS points into SHIP_ID hash shards so that later track construction can be processed in manageable units. 
 
-The script can calculate three different measures of activity. track_km estimates the distance travelled through each map pixel, vessel_hours estimates the amount of time all of the vessels under analysis spent within a given pixel, and point_count counts the number of qualifying AIS observations within each pixel. For the track-based metrics, consecutive observations are ordered by vessel and time, joined into movement segments, and checked for excessive time gaps or unrealistic implied speeds before being included.
+The script supports two track-based measures of activity: track_km, which accumulates vessel distance through map pixels, and vessel_hours, which accumulates vessel movement time. Consecutive AIS observations are ordered by vessel and timestamp, converted into movement segments, and filtered for invalid timing, excessive gaps, unrealistic implied speeds and the configured minimum-speed threshold before their values are passed to the rasterisation stage.
 
-The accepted observations or track segments are converted into Web Mercator pixel coordinates at each selected zoom level. The script then accumulates the chosen metric into a sparse pixel dataset, which allows large areas to be processed without storing every empty map pixel. Work is divided into batches and vessel-based shards, while DuckDB and temporary Parquet files are used to control memory use and support large datasets.
+The accepted track segments are converted into Web Mercator pixel coordinates and rasterised at the maximum requested zoom using a vectorised Numba implementation where available. Pixel contributions are accumulated sparsely in NumPy, compacted into unique pixels and written to compressed Parquet parts, after which lower analytical zooms can be derived by successively aggregating 2 × 2 pixel blocks rather than rerasterising all of the original vessel segments.
 
-After the analytical pixel values have been calculated, the script can create visual heatmap tiles by applying blur, logarithmic scaling, colour and transparency. These tiles can be written as standard XYZ PNG folders or packaged into a single MBTiles file for use in QGIS, web maps or other compatible applications.
+The analytical pixel values can then be rendered into visual heatmap tiles using configurable blur, logarithmic scaling, colour and transparency. The current architecture uses memory-bounded high-zoom rendering, optional vectorised SciPy blur, parallel tile workers and a canonical MBTiles archive, from which standard XYZ PNG files can be generated independently.
 
-The script can also preserve the underlying numeric results as sparse Parquet files or Float32 GeoTIFFs. These analytical outputs allow users to inspect, compare and perform further calculations on the actual activity values rather than relying only on the rendered heatmap colours.
+The script can also preserve the underlying numeric density values as sparse Parquet data or Float32 GeoTIFFs for analytical use rather than visualisation alone. It is designed as a resumable production pipeline: analytical, rendering and export stages have separate configuration fingerprints and completion checkpoints, allowing completed work to be reused after interruption or when only later output stages need to be regenerated.
 
-Overall, the script provides a configurable way to transform raw AIS observations into reusable density products that support route analysis, vessel-activity assessment, customer visualisations and bespoke spatial requests. It operates independently of the aggregate spatial-index workflow and requires only the downloaded AIS data, vessel metadata and the settings defined in config.env.
+Overall, the script provides a configurable and performance-optimised way to transform large AIS datasets into reusable density products, with DuckDB, Parquet, NumPy, Numba, staged checkpoints, bounded rendering and detailed performance monitoring used to manage processing time, memory and recovery. The current implementation is centred on track_km and vessel_hours and separates the analytical calculation from visual rendering and final export.
 
 
 # AIS Density Map Script: High-Level Code Blocks
 
-- Script overview, imports and mapping constants — Lines 1–61: Describes the three supported density metrics, loads the data-processing, database, raster and image libraries, and defines the Web Mercator and Earth-measurement constants used throughout the script.
+- Script overview, imports and mapping constants — Lines 1–123: Describes the resumable density-map architecture, loads DuckDB, NumPy, PyArrow, Pillow, tqdm and optional Numba, SciPy, psutil and Rasterio accelerators, and defines the Web Mercator, tile-size and colour-mapping constants used throughout the pipeline.    
+- Spyder settings and performance configuration — Lines 125–340: Defines the default AIS/vessel/output paths, vessel groups, density metric, speed rules, zoom range, DuckDB resources, sharding, rasterisation, rendering, GeoTIFF and output settings, together with batching, caching, threading and memory-control parameters.
+- Path, naming and configuration helper functions — Lines 342–755: Provides safe SQL/string handling, compact output-path generation, dataset-name inference, analytical/render/export configuration builders and stable configuration fingerprints used to identify compatible resumable outputs.
+- Run-state, checkpoint and completion management — Lines 766–1437: Implements stage-specific configuration hashes, completion markers and resumable state for segment, analytical, render and export stages, allowing the script to distinguish valid existing outputs from incomplete or incompatible runs.
+- Performance profiling and resource monitoring — Lines 1439–1921: Records stage timings, CPU and memory use, process-tree resources, disk I/O, throughput and performance events, while also producing JSON, CSV and system-information diagnostics and long-run console heartbeats.
+- General Parquet, coordinate and DuckDB utility functions — Lines 1925–3400: Provides file-size and Parquet metadata helpers, Web Mercator coordinate conversion, compact pixel storage, compression handling, temporary-directory management and consistent DuckDB thread, memory and spill configuration.
+- Vessel metadata selection — Lines 3402–3451: Reads the vessel metadata CSV, filters to the requested COMFLEET_GROUPEDTYPE vessel groups and creates a temporary DuckDB lookup table of selected SHIP_ID values before AIS processing begins.
+- AIS point staging and SHIP_ID sharding — Lines 3454–3543: Reads the source AIS Parquet files once, applies the vessel filter, selects only the columns required for density processing, converts speed into knots, validates timestamps and coordinates, and writes the retained points into Parquet datasets partitioned by SHIP_ID hash shard.
+- Track-segment construction and quality filtering — Lines 3546–3728: Processes each SHIP_ID shard independently, orders positions by vessel and timestamp, creates consecutive-point segments with LAG, calculates elapsed time and great-circle distance, rejects excessive gaps and unrealistic implied speeds, applies the speed threshold and writes compact or diagnostic segment checkpoints.
+- Segment checkpoint orchestration and optional parallelism — Lines 3731–3965: Reuses completed staged and segment checkpoints where possible, identifies only incomplete shards, and optionally processes pending shards in parallel worker processes with controlled DuckDB thread allocation.
+- Vectorised segment rasterisation and sparse pixel-part generation — Lines 3968–4348: Streams segment checkpoints through Arrow batches, converts endpoints to Web Mercator pixels, samples each segment at the configured pixel spacing, uses Numba for the optimised rasterisation path where available, compacts duplicate pixel keys with NumPy and periodically writes sparse pixel parts to compressed Parquet.
+- Pixel aggregation and analytical checkpoints — Lines 4352–4682: Combines duplicate pixel contributions with DuckDB, creates one sparse analytical pixel table per zoom, writes resumable aggregated-pixel Parquet checkpoints and can recover a trustworthy analytical layer from either internal checkpoints or existing analytical value-pixel exports.
+- Analytical value outputs and GeoTIFF generation — Lines 4684–5400: Writes analytical metadata and optional compact/enriched pixel Parquet outputs, creates individual Float32 GeoTIFF tiles or composite GeoTIFFs, and uses benchmark-selected ZSTD compression, tiled storage and bounded batch/strip writing for large analytical rasters
+- Density heatmap rendering and colourisation — Lines 5406–5479: Builds the Gaussian blur kernel, places analytical values into tile arrays, applies either vectorised SciPy convolution or the legacy splat method, performs logarithmic colour scaling and transparency mapping and converts the resulting RGBA arrays to PNG.
+- MBTiles creation and tile-rendering infrastructure — Lines 5493–6600: Creates and validates the canonical MBTiles archive, manages SQLite performance settings, determines per-zoom colour-scale limits, expands only edge pixels required by the blur radius and prepares bounded whole-tile rendering workers
+- Memory-bounded high-zoom rendering — Lines 5964–6600: For large pixel tables or high zooms, builds a compact render-source cache partitioned by tile-row bands and renders only the active band plus its blur halo, avoiding the memory cost of a global high-zoom sort.
+- Zoom rendering and MBTiles persistence — Lines 6617–6985: Determines the rendering mode and stream strategy, renders tiles with bounded worker queues, colourises and PNG-encodes them, converts XYZ rows to TMS order and commits encoded PNGs to the canonical MBTiles archive in batches.
+- XYZ export from MBTiles — Lines 6988–7216: Derives the file-based XYZ tile hierarchy directly from the already-encoded MBTiles PNGs, using parallel file writers and tile-column checkpoints so XYZ generation can resume independently without rerendering the density data.
+- Command-line parsing and runtime options — Lines 7219–7599: Defines the PowerShell interface for AIS paths, vessel metadata, metric, vessel groups, speed and track-quality rules, zooms, DuckDB resources, rasterisation, rendering, GeoTIFF outputs, checkpoints, resumption and diagnostic behaviour.
+- Main workflow, recovery and cleanup — Lines 7601–8695: Creates or resumes the named run, validates existing outputs, establishes isolated DuckDB scratch storage, profiles the run, builds/reuses segments, creates the maximum analytical zoom and derives lower zooms from it where enabled, writes analytical outputs, renders MBTiles, derives XYZ, validates completion and cleans up temporary work while preserving failure diagnostics.
+- Script entry point — Lines 8697–8712: Separates Spyder-specific execution settings from the general pipeline, optionally prevents Windows system sleep during long runs, and starts run_pipeline() when the script is executed directly.
 
-- Metric descriptions and configuration parsing helpers — Lines 64–237: Defines the meaning of each metric and provides reusable functions for reading text, Boolean, integer, decimal, list, path and analytical-zoom values from config.env.
-
-- Configuration validation and loading — Lines 239–410: Reads all runtime settings from config.env, converts them into an argument object, and validates the selected metric, zoom range, speed threshold, processing resources and requested output formats.
-
-- General SQL, filename and input-discovery helpers — Lines 413–434: Provides safe SQL quoting, output-name cleaning and recursive discovery of AIS Parquet and GeoParquet source files.
-
-- Web Mercator coordinate and sparse-pixel helpers — Lines 437–527: Converts longitude and latitude into global Web Mercator pixels, samples vessel segments across those pixels, accumulates metric values and periodically writes sparse pixel parts to Parquet.
-
-- DuckDB resource configuration — Lines 529–572: Applies the configured thread count, memory limit, temporary storage location and insertion-order settings to each DuckDB processing connection.
-
-- Vessel metadata selection — Lines 574–639: Reads the vessel metadata CSV, standardises vessel IDs and grouped vessel types, filters to the requested vessel groups and creates a temporary lookup table for use during AIS processing.
-
-- AIS point staging and vessel-based sharding — Lines 642–735: Reads the downloaded AIS Parquet files, joins them to the selected vessel list, converts speed into knots, validates coordinates and timestamps, and partitions the retained observations by vessel-ID hash for manageable processing.
-
-- Track-segment construction and quality filtering — Lines 738–987: For track_km and vessel_hours, orders observations by vessel and time, connects consecutive positions, rejects long gaps or unrealistic movements, applies the inclusive speed threshold and calculates the distance or elapsed-time value assigned to each valid segment.
-
-- Direct point-count preparation — Lines 989–1116: For point_count, reads qualifying AIS observations directly, applies the vessel-group and minimum-speed filters, assigns each observation a value of one and writes a compact staged dataset without constructing tracks.
-
-- Metric rasterisation into pixel parts — Lines 1118–1296: Processes either valid track segments or individual AIS points in batches, converts them into pixels at each requested zoom and writes temporary sparse Parquet parts when the in-memory accumulator reaches its configured limit.
-
-- Pixel aggregation and analytical zoom selection — Lines 1298–1351: Combines all temporary pixel parts for a zoom into one summed pixel table and determines whether analytical value outputs should be created for that zoom.
-
-- Analytical metadata and sparse value output — Lines 1353–1462: Calculates Web Mercator resolution, writes JSON metadata describing the selected metric and filters, and exports the underlying non-zero pixel values as analytical Parquet files.
-
-- Analytical GeoTIFF creation — Lines 1464–1833: Creates projection information and writes either individual Float32 GeoTIFF tiles or larger composite GeoTIFFs containing the underlying numeric density values.
-
-- Analytical output coordination — Lines 1835–1879: Controls which Parquet and GeoTIFF analytical products are written for each zoom according to the configured output settings.
-
-- Visual heatmap processing — Lines 1881–1956: Builds the blur kernel, distributes each pixel value into the surrounding image area, applies logarithmic colour scaling and transparency, and converts the rendered result into PNG data.
-
-- MBTiles setup and visual scaling helpers — Lines 1958–2077: Creates the MBTiles database structure and metadata, calculates the colour-scale maximum for each zoom, and retrieves the source pixels required to render each map tile.
-
-- XYZ and MBTiles tile rendering — Lines 2079–2173: Renders each populated tile, applies blur and colourisation, writes standard XYZ PNG files, inserts tiles into MBTiles using the required TMS row order and reports the total tiles created.
-
-- Main workflow setup — Lines 2176–2245: Loads the configuration, validates input paths, reports the selected metric and speed rules, generates output names and prepares the working, XYZ and MBTiles locations.
-
-- Metric-specific preparation and zoom processing — Lines 2246–2324: Chooses either the point-count or track-segment workflow, creates the MBTiles file when requested, processes every zoom, aggregates pixel values, writes analytical products and renders visual tiles.
-
-- Completion reporting and cleanup — Lines 2326–2347: Closes databases, reports the generated outputs and removes temporary working files unless KEEP_WORK is enabled.
-
-- Script entry point — Lines 2349–2350: Starts the complete density-map workflow when the Python file is executed directly.
